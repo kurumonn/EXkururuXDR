@@ -1,0 +1,22 @@
+{
+  "schema_version": "common_security_event_v1",
+  "event_id": "xdr-import-evt-003",
+  "time": "2026-03-11T00:18:00Z",
+  "product": "exkururuxdr_import",
+  "category": "correlation",
+  "event_type": "manual_case_import",
+  "asset_id": "host-002",
+  "hostname": "app01",
+  "user": "operator01",
+  "src_ip": "203.0.113.10",
+  "dst_ip": "192.0.2.44",
+  "severity": "medium",
+  "score": 64,
+  "labels": [
+    "import",
+    "case_seed"
+  ],
+  "raw_ref": "import://xdr/manual/case-20260311-001",
+  "incident_id": "inc-20260311-001",
+  "correlation_rule_id": "xdr_corr_001"
+}

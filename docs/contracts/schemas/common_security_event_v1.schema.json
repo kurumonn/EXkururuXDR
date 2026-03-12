@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kurutann.com/schemas/common_security_event_v1.schema.json",
+  "title": "Common Security Event Schema v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "event_id",
+    "time",
+    "product",
+    "category",
+    "event_type",
+    "severity",
+    "score",
+    "labels"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "common_security_event_v1"
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "product": {
+      "type": "string",
+      "enum": [
+        "exkururuipros",
+        "exkururuedr",
+        "exkururuxdr_import"
+      ]
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "network",
+        "process",
+        "file",
+        "persistence",
+        "identity",
+        "correlation"
+      ]
+    },
+    "event_type": {
+      "type": "string",
+      "minLength": 1
+    },
+    "asset_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "hostname": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "user": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "src_ip": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "dst_ip": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "severity": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ]
+    },
+    "score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "labels": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "raw_ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

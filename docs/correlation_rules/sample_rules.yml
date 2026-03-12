@@ -1,0 +1,36 @@
+rules:
+  - rule_id: xdr-ndr-edr-persistence-burst
+    name: NDR + EDR persistence burst
+    version: 1.0.0
+    enabled: true
+    description: NDR beaconing and EDR persistence events from the same src_ip within 5 minutes.
+    event_types:
+      - BEACONING
+      - PERSISTENCE_REGISTRY_RUNKEY
+    products:
+      - exkururuipros
+      - exkururuedr
+    group_by:
+      - src_ip
+    window_sec: 300
+    min_hits: 2
+    min_distinct_products: 2
+    severity: high
+
+  - rule_id: xdr-edr-powershell-repetition
+    name: Repeated suspicious powershell
+    version: 1.0.0
+    enabled: true
+    description: Same src_ip repeatedly emits suspicious powershell process events.
+    event_types:
+      - SUSPICIOUS_PROCESS
+    products:
+      - exkururuedr
+    labels_contains:
+      - powershell
+    group_by:
+      - src_ip
+    window_sec: 600
+    min_hits: 3
+    min_distinct_products: 1
+    severity: medium

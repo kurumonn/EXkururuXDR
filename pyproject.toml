@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exkururu-xdr"
+version = "0.1.0"
+description = "Lightweight XDR correlation engine for common_security_event_v1"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "kurumonn" }]
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "PyYAML>=6.0,<7.0",
+  "uvicorn>=0.30,<1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0,<9.0",
+  "httpx>=0.27,<1.0",
+]
+
+[project.scripts]
+exkururu-xdr-correlate = "exkururuxdr.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

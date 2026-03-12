@@ -1,0 +1,24 @@
+{
+  "schema_version": "common_security_event_v1",
+  "event_id": "edr-evt-002",
+  "time": "2026-03-11T00:16:30Z",
+  "product": "exkururuedr",
+  "category": "process",
+  "event_type": "suspicious_process_spawn",
+  "asset_id": "host-001",
+  "hostname": "pc01",
+  "user": "alice",
+  "src_ip": null,
+  "dst_ip": null,
+  "severity": "high",
+  "score": 85,
+  "labels": [
+    "execution",
+    "script",
+    "encoded_command"
+  ],
+  "raw_ref": "local://edr/events/edr-evt-002",
+  "process_name": "powershell.exe",
+  "parent_process_name": "winword.exe",
+  "command_line": "powershell -EncodedCommand ..."
+}

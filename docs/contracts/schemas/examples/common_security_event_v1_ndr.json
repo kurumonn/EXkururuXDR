@@ -1,0 +1,22 @@
+{
+  "schema_version": "common_security_event_v1",
+  "event_id": "ndr-evt-001",
+  "time": "2026-03-11T00:15:00Z",
+  "product": "exkururuipros",
+  "category": "network",
+  "event_type": "suspicious_outbound",
+  "asset_id": "host-001",
+  "hostname": "vps-01",
+  "user": null,
+  "src_ip": "10.0.0.5",
+  "dst_ip": "198.51.100.8",
+  "severity": "high",
+  "score": 87,
+  "labels": [
+    "c2",
+    "beaconing"
+  ],
+  "raw_ref": "local://ipros/events/ndr-evt-001",
+  "dst_port": 443,
+  "protocol": "tcp"
+}

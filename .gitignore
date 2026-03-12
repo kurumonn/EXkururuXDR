@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Virtual env
+.venv/
+venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+rust_chain_bench/target/
+
+# Local state and generated outputs
+*.db
+*.sqlite3
+*.log
+docs/*.json
