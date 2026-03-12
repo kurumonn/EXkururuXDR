@@ -1,12 +1,11 @@
-# 4-Stack Demo Note
+# 4製品デモ概要
 
-This repository provides the XDR role in the EXkururu 4-stack demo.
+このリポジトリは、EXkururu 4製品デモにおける XDR の役割を担当します。
 
-The public repository documents only the high-level sequence:
+公開リポジトリでは、高レベルな処理順だけを記載しています。
 
-1. Upstream products submit normalized events
-2. XDR correlates them into incidents
-3. Downstream control planes consume the resulting cases and actions
+1. 上流製品が正規化イベントを送信する
+2. XDR がそれらを相関してインシデント化する
+3. 下流の制御プレーンがケースやアクションを利用する
 
-Environment-specific bootstrap values and operational demo payloads are intentionally kept outside the
-public repository.
+環境固有の起動値やデモ用ペイロードは公開リポジトリ外で管理します。

@@ -1,24 +1,22 @@
 # exkururuXDR
 
-[English README](README.en.md)
-[4-stack demo note](README.4stack.md)
+[英語版 README](README.en.md)  
+[4製品デモ概要](README.4stack.md)
 
-EXkururuXDR correlates events from adjacent security products and turns them into incidents, cases, and
-actions. The public repository keeps the integration-facing surface, schema contracts, and local startup
-path that are useful to evaluate openly.
+EXkururuXDR は、隣接するセキュリティ製品から受けたイベントを相関し、インシデント、ケース、アクションへ落とし込む XDR コンポーネントです。  
+この公開リポジトリでは、連携面、イベント契約、スキーマ、ローカル起動導線など、公開して評価価値の高い範囲を残しています。
 
-## Public scope
+## 公開範囲
 
-- Common event contract and schema
-- Source registry and ingest API
-- Incident, case, and action API surface
-- Lightweight standalone deployment
-- Example correlation rule format
+- 共通イベント契約とスキーマ
+- Source registry と ingest API
+- Incident / Case / Action API
+- 軽量な単体デプロイ導線
+- 相関ルール形式のサンプル
 
-Correlation weighting, tuning logic, production acceptance thresholds, and detailed optimization notes are
-intentionally excluded from the public distribution.
+相関重み付け、本番閾値、チューニング値、最適化の核心は公開版から除外しています。
 
-## Architecture role
+## 役割
 
 ```text
 Product events
@@ -31,7 +29,7 @@ Product events
  downstream review and action
 ```
 
-## Quick Start
+## クイックスタート
 
 ```bash
 cd /path/to/exkururuXDR
@@ -43,18 +41,18 @@ mkdir -p data
 ./.venv/bin/uvicorn exkururuxdr.api:app --app-dir src --reload --port 8810
 ```
 
-## Public environment variables
+## 公開している環境変数
 
 - `XDR_API_ADMIN_TOKEN`
 - `XDR_SOURCE_TOKEN_PEPPER`
 
-## Public assets
+## 公開している主な資産
 
-- Contract: `docs/contracts/common_security_event_schema_v1.md`
-- Schema: `docs/contracts/schemas/common_security_event_v1.schema.json`
-- Example rules: `docs/correlation_rules/sample_rules.yml`
+- 契約仕様: `docs/contracts/common_security_event_schema_v1.md`
+- スキーマ: `docs/contracts/schemas/common_security_event_v1.schema.json`
+- ルール例: `docs/correlation_rules/sample_rules.yml`
 
-## API highlights
+## 主な API
 
 - `GET /healthz`
 - `GET /dashboard`
@@ -65,7 +63,7 @@ mkdir -p data
 - `POST /api/v1/cases`
 - `POST /api/v1/actions`
 
-## Testing
+## テスト
 
 ```bash
 cd /path/to/exkururuXDR
