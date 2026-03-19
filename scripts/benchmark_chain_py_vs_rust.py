@@ -112,7 +112,7 @@ def main() -> None:
     parser.add_argument("--events", type=int, default=150000)
     parser.add_argument("--loops", type=int, default=6)
     parser.add_argument("--window-sec", type=int, default=300)
-    parser.add_argument("--out", type=Path, default=ROOT / "docs" / "perf_xdr_chain_py_vs_rust.json")
+    parser.add_argument("--out", type=Path, default=Path("/tmp/perf_xdr_chain_py_vs_rust.json"))
     args = parser.parse_args()
 
     lines = generate_input_lines(events=max(1, args.events), loops=max(1, args.loops), window_sec=max(30, args.window_sec))

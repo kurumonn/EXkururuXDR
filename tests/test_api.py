@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import hashlib
 import hmac
 import json
@@ -9,6 +10,7 @@ import time
 from fastapi.testclient import TestClient
 
 from exkururuxdr.api import create_app
+from exkururuxdr.replay_cache import ReplayCache
 
 
 def build_client(tmp_path):
@@ -21,11 +23,12 @@ def admin_headers() -> dict[str, str]:
     return {"Authorization": "Bearer test-admin-token"}
 
 
-def source_signature_headers(token: str, payload: dict) -> dict[str, str]:
+def source_signature_headers(token: str, payload: dict, *, nonce: str | None = None) -> dict[str, str]:
     ts = str(int(time.time()))
+    nonce_value = str(nonce or f"nonce-{time.time_ns()}").strip()
     raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    sig = hmac.new(token.encode("utf-8"), f"{ts}.".encode("utf-8") + raw, hashlib.sha256).hexdigest()
-    return {"X-Source-Timestamp": ts, "X-Source-Signature": sig}
+    sig = hmac.new(token.encode("utf-8"), f"{ts}.{nonce_value}.".encode("utf-8") + raw, hashlib.sha256).hexdigest()
+    return {"X-Source-Timestamp": ts, "X-Source-Nonce": nonce_value, "X-Source-Signature": sig}
 
 
 def sample_event(event_id: str = "evt-1") -> dict:
@@ -526,3 +529,124 @@ def test_signed_required_source_contract_and_rotate_token(tmp_path) -> None:
         headers={"X-Source-Key": "signed-edr-01", "X-Source-Token": token, **old_sig_headers},
     )
     assert old_try.status_code == 401
+
+
+def test_signed_required_source_rejects_missing_nonce(tmp_path) -> None:
+    client = build_client(tmp_path)
+    created = client.post(
+        "/api/v1/sources",
+        json={
+            "source_key": "signed-edr-02",
+            "product": "exkururuedr",
+            "display_name": "Signed EDR 02",
+            "trust_mode": "signed_required",
+            "allow_event_ingest": True,
+        },
+        headers=admin_headers(),
+    )
+    assert created.status_code == 201
+    token = created.json()["token"]
+    payload = sample_event("signed-evt-2")
+    ts = str(int(time.time()))
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    legacy_sig = hmac.new(token.encode("utf-8"), f"{ts}.".encode("utf-8") + raw, hashlib.sha256).hexdigest()
+    response = client.post(
+        "/api/v1/events/single",
+        json=payload,
+        headers={
+            "X-Source-Key": "signed-edr-02",
+            "X-Source-Token": token,
+            "X-Source-Timestamp": ts,
+            "X-Source-Signature": legacy_sig,
+        },
+    )
+    assert response.status_code == 401
+    assert response.json()["detail"] == "source_nonce_required"
+
+
+def test_signed_required_source_replay_is_blocked(tmp_path) -> None:
+    client = build_client(tmp_path)
+    created = client.post(
+        "/api/v1/sources",
+        json={
+            "source_key": "signed-edr-03",
+            "product": "exkururuedr",
+            "display_name": "Signed EDR 03",
+            "trust_mode": "signed_required",
+            "allow_event_ingest": True,
+        },
+        headers=admin_headers(),
+    )
+    assert created.status_code == 201
+    token = created.json()["token"]
+    payload = sample_event("signed-evt-3")
+    headers = {"X-Source-Key": "signed-edr-03", "X-Source-Token": token, **source_signature_headers(token, payload)}
+    first = client.post("/api/v1/events/single", json=payload, headers=headers)
+    second = client.post("/api/v1/events/single", json=payload, headers=headers)
+    assert first.status_code == 202
+    assert second.status_code == 409
+    assert second.json()["detail"] == "source_replay_detected"
+
+
+def test_signed_required_source_replay_across_cache_instances(tmp_path, monkeypatch) -> None:
+    api = importlib.import_module("exkururuxdr.api")
+    client = build_client(tmp_path)
+    created = client.post(
+        "/api/v1/sources",
+        json={
+            "source_key": "signed-edr-04",
+            "product": "exkururuedr",
+            "display_name": "Signed EDR 04",
+            "trust_mode": "signed_required",
+            "allow_event_ingest": True,
+        },
+        headers=admin_headers(),
+    )
+    assert created.status_code == 201
+    token = created.json()["token"]
+    payload = sample_event("signed-evt-4")
+    headers = {"X-Source-Key": "signed-edr-04", "X-Source-Token": token, **source_signature_headers(token, payload)}
+
+    class _SharedRedis:
+        def __init__(self, clock_fn):
+            self._clock = clock_fn
+            self._values: dict[str, float] = {}
+
+        def set(self, key, value, nx=False, ex=None):
+            now = float(self._clock())
+            current = self._values.get(key)
+            if nx and current is not None and current > now:
+                return False
+            self._values[key] = now + float(ex or 0)
+            return True
+
+    clock = lambda: 1000.0
+    shared_redis = _SharedRedis(clock)
+    cache_a = ReplayCache(
+        namespace="xdr",
+        backend="redis",
+        redis_url="redis://example.invalid/0",
+        fallback_to_memory=True,
+        max_items=10,
+        default_ttl_sec=60,
+        redis_client_factory=lambda: shared_redis,
+        clock=clock,
+    )
+    cache_b = ReplayCache(
+        namespace="xdr",
+        backend="redis",
+        redis_url="redis://example.invalid/0",
+        fallback_to_memory=True,
+        max_items=10,
+        default_ttl_sec=60,
+        redis_client_factory=lambda: shared_redis,
+        clock=clock,
+    )
+
+    monkeypatch.setattr(api, "_REPLAY_GUARD", cache_a, raising=False)
+    first = client.post("/api/v1/events/single", json=payload, headers=headers)
+    assert first.status_code == 202
+    monkeypatch.setattr(api, "_REPLAY_GUARD", cache_b, raising=False)
+    second = client.post("/api/v1/events/single", json=payload, headers=headers)
+    assert second.status_code == 409
+    assert second.json()["detail"] == "source_replay_detected"

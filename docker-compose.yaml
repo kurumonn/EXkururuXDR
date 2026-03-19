@@ -1,0 +1,29 @@
+services:
+  xdr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:8810:8810"
+    environment:
+      XDR_API_ADMIN_TOKEN: ${XDR_API_ADMIN_TOKEN:-change-me}
+      XDR_REPLAY_BACKEND: ${XDR_REPLAY_BACKEND:-redis}
+      XDR_REDIS_URL: redis://redis:6379/0
+      XDR_REPLAY_FALLBACK_TO_MEMORY: ${XDR_REPLAY_FALLBACK_TO_MEMORY:-1}
+      XDR_SOURCE_TOKEN_PEPPER: ${XDR_SOURCE_TOKEN_PEPPER:-change-me}
+      XDR_DEFAULT_WORKSPACE: ${XDR_DEFAULT_WORKSPACE:-lab}
+      XDR_ORCHESTRATOR_DRY_RUN: ${XDR_ORCHESTRATOR_DRY_RUN:-true}
+    volumes:
+      - ./data:/app/data
+      - ./:/app
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "yes"]
+    volumes:
+      - xdr-redis:/data
+
+volumes:
+  xdr-redis:

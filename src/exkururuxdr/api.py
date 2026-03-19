@@ -4,6 +4,7 @@ import csv
 import html
 import hmac
 import os
+import re
 import time
 from hmac import compare_digest
 from io import StringIO
@@ -16,7 +17,9 @@ from pydantic import BaseModel, Field
 
 from .ipros_adapter import ADAPTER_VERSION, adapt_ipros_event
 from .orchestrator import dispatch_requested_actions
+from .replay_cache import replay_cache_from_env
 from .storage import SourceRecord, XdrStorage
+from .storage_facade import XdrReadStorage, XdrWriteStorage
 from .validation import ALLOWED_PRODUCTS, validate_event, validate_event_batch
 
 
@@ -139,6 +142,15 @@ class SourceSecurityUpdateRequest(BaseModel):
 
 VALID_REMOTE_ACTION_ACK_STATUSES = {"pending", "in_progress", "completed", "failed"}
 VALID_IPROS_REMOTE_ACTION_TYPES = {"block_ip", "unblock_ip", "set_enforcement", "enforcement"}
+_NONCE_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{8,80}$")
+_REPLAY_GUARD = replay_cache_from_env(
+    namespace="xdr",
+    backend_env="XDR_REPLAY_BACKEND",
+    redis_url_env="XDR_REDIS_URL",
+    fallback_env="XDR_REPLAY_FALLBACK_TO_MEMORY",
+    max_items_env="XDR_REPLAY_CACHE_MAX_ITEMS",
+    ttl_env="XDR_SOURCE_REPLAY_TTL_SEC",
+)
 
 
 def _parse_csv_events(csv_text: str) -> list[dict[str, Any]]:
@@ -185,6 +197,33 @@ def _parse_csv_events(csv_text: str) -> list[dict[str, Any]]:
                 event[optional_key] = value
         events.append(event)
     return events
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = str(os.getenv(name, "1" if default else "0") or "").strip().lower()
+    return raw in {"1", "true", "on", "yes"}
+
+
+def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
+    raw = str(os.getenv(name, str(default)) or "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+def _source_signature_v2(token: str, timestamp: str, body: bytes, nonce: str = "") -> str:
+    nonce_value = str(nonce or "").strip()
+    if nonce_value:
+        payload = f"{timestamp}.{nonce_value}.".encode("utf-8") + body
+    else:
+        payload = f"{timestamp}.".encode("utf-8") + body
+    return hmac.new(key=token.encode("utf-8"), msg=payload, digestmod="sha256").hexdigest()
+
+
+def _replay_guard_add(raw_key: str, ttl_sec: int) -> bool:
+    return _REPLAY_GUARD.add(raw_key, ttl_sec=ttl_sec)
 
 
 def _render_dashboard(data: dict[str, Any]) -> str:
@@ -293,9 +332,17 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     app = FastAPI(title="EXkururuXDR API", version="0.1.0")
     storage = XdrStorage(db_path or Path("data/xdr.sqlite3"))
     app.state.storage = storage
+    app.state.read_storage = XdrReadStorage(storage)
+    app.state.write_storage = XdrWriteStorage(storage)
 
     def get_storage() -> XdrStorage:
         return app.state.storage
+
+    def get_read_storage() -> XdrReadStorage:
+        return app.state.read_storage
+
+    def get_write_storage() -> XdrWriteStorage:
+        return app.state.write_storage
 
     def require_admin(authorization: str = Header(default="")) -> None:
         expected = os.getenv("XDR_API_ADMIN_TOKEN", "").strip()
@@ -322,7 +369,8 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         x_source_token: str = Header(default=""),
         x_source_timestamp: str = Header(default=""),
         x_source_signature: str = Header(default=""),
-        storage: XdrStorage = Depends(get_storage),
+        x_source_nonce: str = Header(default=""),
+        storage: XdrReadStorage = Depends(get_read_storage),
     ) -> SourceRecord:
         source = storage.authenticate_source(x_source_key, x_source_token)
         if source is None:
@@ -332,6 +380,12 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         if source.trust_mode == "signed_required":
             if not x_source_timestamp or not x_source_signature:
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="source_signature_required")
+            require_nonce = _env_bool("XDR_SOURCE_REQUIRE_NONCE", True)
+            nonce = str(x_source_nonce or "").strip()
+            if require_nonce and not nonce:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="source_nonce_required")
+            if nonce and not _NONCE_PATTERN.fullmatch(nonce):
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="source_nonce_invalid")
             try:
                 timestamp = int(x_source_timestamp)
             except ValueError as exc:
@@ -340,33 +394,36 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             if abs(now - timestamp) > 300:
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="source_signature_expired")
             raw_body = await request.body()
-            expected_sig = hmac.new(
-                key=x_source_token.encode("utf-8"),
-                msg=f"{x_source_timestamp}.".encode("utf-8") + raw_body,
-                digestmod="sha256",
-            ).hexdigest()
-            if not compare_digest(expected_sig, x_source_signature):
+            expected_sig = _source_signature_v2(x_source_token, x_source_timestamp, raw_body, nonce=nonce)
+            legacy_sig = _source_signature_v2(x_source_token, x_source_timestamp, raw_body, nonce="")
+            if not compare_digest(expected_sig, x_source_signature) and not (
+                not require_nonce and compare_digest(legacy_sig, x_source_signature)
+            ):
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="source_signature_invalid")
+            replay_ttl = _env_int("XDR_SOURCE_REPLAY_TTL_SEC", 310, 30, 3600)
+            replay_raw = f"{source.source_key}:{request.url.path}:{x_source_timestamp}:{x_source_signature}:{nonce}"
+            if not _replay_guard_add(replay_raw, ttl_sec=replay_ttl):
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="source_replay_detected")
         return source
 
     @app.get("/healthz")
-    def healthz(storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def healthz(storage: XdrReadStorage = Depends(get_read_storage)) -> dict[str, Any]:
         return {"ok": True, "sources": storage.count_sources(), "events": storage.count_events()}
 
     @app.get("/dashboard", response_class=HTMLResponse, dependencies=[Depends(require_admin)])
-    def standalone_dashboard(storage: XdrStorage = Depends(get_storage)) -> str:
+    def standalone_dashboard(storage: XdrReadStorage = Depends(get_read_storage)) -> str:
         return _render_dashboard(storage.dashboard_summary())
 
     @app.get("/api/v1/events", dependencies=[Depends(require_admin)])
     def list_events(
         limit: int = 100,
         source_key: str | None = None,
-        storage: XdrStorage = Depends(get_storage),
+        storage: XdrReadStorage = Depends(get_read_storage),
     ) -> dict[str, Any]:
         return {"items": storage.list_events(limit=limit, source_key=source_key)}
 
     @app.get("/api/v1/sources", dependencies=[Depends(require_admin)])
-    def list_sources(storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def list_sources(storage: XdrReadStorage = Depends(get_read_storage)) -> dict[str, Any]:
         return {
             "items": [
                 {
@@ -388,7 +445,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     def update_source_security(
         source_key: str,
         body: SourceSecurityUpdateRequest,
-        storage: XdrStorage = Depends(get_storage),
+        storage: XdrWriteStorage = Depends(get_write_storage),
     ) -> dict[str, Any]:
         try:
             source = storage.update_source_security(
@@ -409,7 +466,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         }
 
     @app.post("/api/v1/sources/{source_key}/rotate-token", dependencies=[Depends(require_admin)])
-    def rotate_source_token(source_key: str, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def rotate_source_token(source_key: str, storage: XdrWriteStorage = Depends(get_write_storage)) -> dict[str, Any]:
         try:
             source = storage.rotate_source_token(source_key)
         except KeyError as exc:
@@ -421,7 +478,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         }
 
     @app.get("/api/v1/ipros/exports", dependencies=[Depends(require_admin)])
-    def list_ipros_exports(limit: int = 100, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def list_ipros_exports(limit: int = 100, storage: XdrReadStorage = Depends(get_read_storage)) -> dict[str, Any]:
         return {"items": storage.list_export_records(limit=limit)}
 
     @app.get("/api/v1/ipros/remote-actions", dependencies=[Depends(require_admin)])
@@ -429,12 +486,12 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         source_key: str | None = None,
         status: str | None = None,
         limit: int = 200,
-        storage: XdrStorage = Depends(get_storage),
+        storage: XdrReadStorage = Depends(get_read_storage),
     ) -> dict[str, Any]:
         return {"items": storage.list_remote_actions(source_key=source_key, status=status, limit=limit)}
 
     @app.post("/api/v1/ipros/remote-actions", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_admin)])
-    def create_remote_action(body: RemoteActionCreateRequest, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def create_remote_action(body: RemoteActionCreateRequest, storage: XdrWriteStorage = Depends(get_write_storage)) -> dict[str, Any]:
         normalized_action_type = "set_enforcement" if body.action_type == "enforcement" else body.action_type
         if normalized_action_type not in VALID_IPROS_REMOTE_ACTION_TYPES:
             raise HTTPException(
@@ -458,7 +515,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     def ack_remote_action(
         remote_action_id: int,
         body: RemoteActionAckRequest,
-        storage: XdrStorage = Depends(get_storage),
+        storage: XdrReadStorage = Depends(get_read_storage),
     ) -> dict[str, Any]:
         if body.status not in VALID_REMOTE_ACTION_ACK_STATUSES:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"invalid_ack_status:{body.status}")
@@ -474,7 +531,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="remote_action_not_found") from exc
 
     @app.post("/api/v1/ipros/heartbeat", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require_admin)])
-    def upsert_ipros_heartbeat(body: SourceHeartbeatRequest, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def upsert_ipros_heartbeat(body: SourceHeartbeatRequest, storage: XdrWriteStorage = Depends(get_write_storage)) -> dict[str, Any]:
         source = storage.ensure_source(
             source_key=body.source_key,
             product=body.product,
@@ -490,11 +547,11 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         return {"accepted": 1, "heartbeat": record}
 
     @app.get("/api/v1/ipros/heartbeat/sources", dependencies=[Depends(require_admin)])
-    def list_ipros_source_health(limit: int = 100, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def list_ipros_source_health(limit: int = 100, storage: XdrReadStorage = Depends(get_read_storage)) -> dict[str, Any]:
         return {"items": storage.list_source_health(limit=limit)}
 
     @app.post("/api/v1/ipros/exports", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require_admin)])
-    def create_ipros_export(body: IprosExportRequest, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def create_ipros_export(body: IprosExportRequest, storage: XdrWriteStorage = Depends(get_write_storage)) -> dict[str, Any]:
         source = storage.ensure_source(
             source_key=body.source_key,
             product="exkururuipros",
@@ -550,7 +607,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         }
 
     @app.post("/api/v1/sources", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_admin)])
-    def create_source(body: SourceCreateRequest, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def create_source(body: SourceCreateRequest, storage: XdrWriteStorage = Depends(get_write_storage)) -> dict[str, Any]:
         if body.product not in ALLOWED_PRODUCTS:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_product")
         try:
@@ -579,7 +636,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     def ingest_single(
         payload: dict[str, Any],
         source: SourceRecord = Depends(require_source),
-        storage: XdrStorage = Depends(get_storage),
+        storage: XdrWriteStorage = Depends(get_write_storage),
     ) -> dict[str, Any]:
         errors = validate_event(payload)
         if errors:
@@ -595,7 +652,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     def ingest_batch(
         body: EventBatchRequest,
         source: SourceRecord = Depends(require_source),
-        storage: XdrStorage = Depends(get_storage),
+        storage: XdrWriteStorage = Depends(get_write_storage),
     ) -> dict[str, Any]:
         valid_events, errors = validate_event_batch(body.events)
         inserted, duplicates = storage.save_events_batch(
@@ -617,7 +674,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         return {"accepted": len(body.events), "inserted": inserted, "duplicates": duplicates}
 
     @app.post("/api/v1/events/manual", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require_admin)])
-    def ingest_manual_event(body: ManualEventRequest, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def ingest_manual_event(body: ManualEventRequest, storage: XdrWriteStorage = Depends(get_write_storage)) -> dict[str, Any]:
         if body.product not in ALLOWED_PRODUCTS:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_product")
         source = storage.ensure_source(
@@ -631,7 +688,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         return {k: result[k] for k in ("accepted", "inserted", "duplicates")}
 
     @app.post("/api/v1/import/json", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require_admin)])
-    def import_json_events(body: JsonImportRequest, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def import_json_events(body: JsonImportRequest, storage: XdrWriteStorage = Depends(get_write_storage)) -> dict[str, Any]:
         if body.product not in ALLOWED_PRODUCTS:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_product")
         source = storage.ensure_source(
@@ -645,7 +702,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         return {k: result[k] for k in ("accepted", "inserted", "duplicates")}
 
     @app.post("/api/v1/import/csv", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require_admin)])
-    def import_csv_events(body: CsvImportRequest, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def import_csv_events(body: CsvImportRequest, storage: XdrWriteStorage = Depends(get_write_storage)) -> dict[str, Any]:
         if body.product not in ALLOWED_PRODUCTS:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_product")
         try:
@@ -663,21 +720,21 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         return {k: result[k] for k in ("accepted", "inserted", "duplicates")}
 
     @app.get("/api/v1/incidents", dependencies=[Depends(require_admin)])
-    def list_incidents(limit: int = 200, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def list_incidents(limit: int = 200, storage: XdrReadStorage = Depends(get_read_storage)) -> dict[str, Any]:
         return {"items": storage.list_incidents(limit=limit)}
 
     @app.get("/api/v1/event-incident-links", dependencies=[Depends(require_admin)])
     def list_event_incident_links(
         incident_id: int | None = None,
         limit: int = 200,
-        storage: XdrStorage = Depends(get_storage),
+        storage: XdrReadStorage = Depends(get_read_storage),
     ) -> dict[str, Any]:
         return {"items": storage.list_event_incident_links(incident_id=incident_id, limit=limit)}
 
     @app.post("/api/v1/event-incident-links", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_admin)])
     def create_event_incident_link(
         body: EventIncidentLinkRequest,
-        storage: XdrStorage = Depends(get_storage),
+        storage: XdrWriteStorage = Depends(get_write_storage),
     ) -> dict[str, Any]:
         try:
             return storage.link_event_incident(
@@ -689,14 +746,14 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="incident_not_found") from exc
 
     @app.get("/api/v1/incidents/{incident_id}", dependencies=[Depends(require_admin)])
-    def get_incident(incident_id: int, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def get_incident(incident_id: int, storage: XdrReadStorage = Depends(get_read_storage)) -> dict[str, Any]:
         try:
             return storage.get_incident(incident_id)
         except KeyError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="incident_not_found") from exc
 
     @app.post("/api/v1/incidents", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_admin)])
-    def create_incident(body: IncidentCreateRequest, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def create_incident(body: IncidentCreateRequest, storage: XdrWriteStorage = Depends(get_write_storage)) -> dict[str, Any]:
         try:
             return storage.create_incident(
                 incident_key=body.incident_key,
@@ -711,18 +768,18 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="incident_key_conflict") from exc
 
     @app.get("/api/v1/cases", dependencies=[Depends(require_admin)])
-    def list_cases(limit: int = 200, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def list_cases(limit: int = 200, storage: XdrReadStorage = Depends(get_read_storage)) -> dict[str, Any]:
         return {"items": storage.list_cases(limit=limit)}
 
     @app.get("/api/v1/cases/{case_id}", dependencies=[Depends(require_admin)])
-    def get_case(case_id: int, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def get_case(case_id: int, storage: XdrReadStorage = Depends(get_read_storage)) -> dict[str, Any]:
         try:
             return storage.get_case(case_id)
         except KeyError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="case_not_found") from exc
 
     @app.post("/api/v1/cases", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_admin)])
-    def create_case(body: CaseCreateRequest, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def create_case(body: CaseCreateRequest, storage: XdrWriteStorage = Depends(get_write_storage)) -> dict[str, Any]:
         return storage.create_case(
             incident_id=body.incident_id,
             title=body.title,
@@ -731,7 +788,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         )
 
     @app.patch("/api/v1/cases/{case_id}", dependencies=[Depends(require_admin)])
-    def update_case(case_id: int, body: CaseUpdateRequest, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def update_case(case_id: int, body: CaseUpdateRequest, storage: XdrWriteStorage = Depends(get_write_storage)) -> dict[str, Any]:
         try:
             return storage.update_case(
                 case_id,
@@ -748,7 +805,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     def add_case_comment(
         case_id: int,
         body: CaseCommentCreateRequest,
-        storage: XdrStorage = Depends(get_storage),
+        storage: XdrWriteStorage = Depends(get_write_storage),
     ) -> dict[str, Any]:
         try:
             return storage.add_case_comment(case_id=case_id, author=body.author, body=body.body)
@@ -756,18 +813,18 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="case_not_found") from exc
 
     @app.get("/api/v1/actions", dependencies=[Depends(require_admin)])
-    def list_actions(storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def list_actions(storage: XdrReadStorage = Depends(get_read_storage)) -> dict[str, Any]:
         return {"items": storage.list_actions()}
 
     @app.get("/api/v1/actions/{action_id}", dependencies=[Depends(require_admin)])
-    def get_action(action_id: int, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def get_action(action_id: int, storage: XdrReadStorage = Depends(get_read_storage)) -> dict[str, Any]:
         try:
             return storage.get_action(action_id)
         except KeyError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="action_not_found") from exc
 
     @app.post("/api/v1/actions", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_admin)])
-    def create_action(body: ActionCreateRequest, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def create_action(body: ActionCreateRequest, storage: XdrWriteStorage = Depends(get_write_storage)) -> dict[str, Any]:
         try:
             return storage.create_action(
                 incident_id=body.incident_id,
@@ -785,7 +842,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     def update_action(
         action_id: int,
         body: ActionUpdateRequest,
-        storage: XdrStorage = Depends(get_storage),
+        storage: XdrWriteStorage = Depends(get_write_storage),
     ) -> dict[str, Any]:
         try:
             return storage.update_action(action_id, status=body.status, result_message=body.result_message)
@@ -795,13 +852,13 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     @app.get("/api/v1/orchestrator/dispatch-logs", dependencies=[Depends(require_admin)])
-    def list_dispatch_logs(limit: int = 100, storage: XdrStorage = Depends(get_storage)) -> dict[str, Any]:
+    def list_dispatch_logs(limit: int = 100, storage: XdrReadStorage = Depends(get_read_storage)) -> dict[str, Any]:
         return {"items": storage.list_dispatch_logs(limit=limit)}
 
     @app.post("/api/v1/orchestrator/dispatch", dependencies=[Depends(require_admin)])
     def run_dispatch(
         body: OrchestratorDispatchRequest,
-        storage: XdrStorage = Depends(get_storage),
+        storage: XdrWriteStorage = Depends(get_write_storage),
     ) -> dict[str, Any]:
         return dispatch_requested_actions(storage=storage, limit=body.limit, dry_run=body.dry_run)
 
